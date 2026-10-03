@@ -180,6 +180,59 @@ describe('jitter budget: first-blocking evidence', () => {
   });
 });
 
+describe('jitter budget: jointly constrained prefix usage in blocker evidence', () => {
+  // Modulus 100 with count window [0, 5] forces absolute counts 0..5, hence
+  // the unique order A->B->C->D->E->F with unit gaps. Times A=0, C=25, D=40,
+  // E=50, F=60 are fixed, B floats in [10, 15]. At nominal 10 each edge can
+  // INDIVIDUALLY reach zero jitter, but the A->B and B->C zero-jitter times
+  // are incompatible (B=10 vs B=15), so the prefix A->B->C forces 5; the
+  // fixed C->D gap of 15 forces 5 more.
+  const joint: PacketInput[] = [
+    { id: 'A', remainder: 0, timeLower: 0, timeUpper: 0 },
+    { id: 'B', remainder: 1, timeLower: 10, timeUpper: 15 },
+    { id: 'C', remainder: 2, timeLower: 25, timeUpper: 25 },
+    { id: 'D', remainder: 3, timeLower: 40, timeUpper: 40 },
+    { id: 'E', remainder: 4, timeLower: 50, timeUpper: 50 },
+    { id: 'F', remainder: 5, timeLower: 60, timeUpper: 60 },
+  ];
+  const jointBase = { modulus: 100, countLower: 0, countUpper: 5, minInterval: 1, maxInterval: 20 };
+
+  it('recovers the unique full chain when no budget is given', () => {
+    const r = solve(joint, jointBase.modulus, jointBase.countLower, jointBase.countUpper,
+      jointBase.minInterval, jointBase.maxInterval);
+    expect(r.order).toEqual(['A', 'B', 'C', 'D', 'E', 'F']);
+    expect(r.assignments.map((a) => a.absoluteCount)).toEqual([0, 1, 2, 3, 4, 5]);
+    expect(r.jitterBudget).toBeUndefined();
+  });
+
+  it('attributes the first blocker to the budget-blocked successor, not an unrelated packet', () => {
+    let caught: SolveError | null = null;
+    try {
+      solve(joint, jointBase.modulus, jointBase.countLower, jointBase.countUpper,
+        jointBase.minInterval, jointBase.maxInterval, { nominalInterval: 10, totalJitterBudget: 4 });
+    } catch (e) {
+      caught = e as SolveError;
+    }
+    expect(caught).not.toBeNull();
+    expect(caught!.code).toBe('NO_CONSISTENT_INTERPRETATION');
+    expect(caught!.evidence?.stage).toBe('extension');
+    // D is the only structurally continuable packet after A->B->C; its block
+    // is the jitter budget. E/F fail their own count windows later in the
+    // canonical order and must not override the first blocker.
+    expect(caught!.evidence?.partialOrder).toEqual(['A', 'B', 'C']);
+    expect(caught!.evidence?.candidateId).toBe('D');
+    expect(caught!.evidence?.detail?.cause).toBe('JITTER_BUDGET');
+    // `used` is the minimum cumulative jitter the whole prefix can realize
+    // simultaneously (5), not the sum of the per-edge minima (0+0).
+    expect(caught!.evidence?.detail?.jitter).toEqual({
+      nominalInterval: 10,
+      budget: 4,
+      used: 5,
+      minimumAdditional: 5,
+    });
+  });
+});
+
 describe('jitter budget: differential testing against brute force', () => {
   it('matches the exhaustive reference on planted chains', () => {
     let feasiblePairs = 0;

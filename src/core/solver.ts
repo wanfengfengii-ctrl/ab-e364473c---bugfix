@@ -1452,18 +1452,28 @@ function buildFailureEvidence(
   const usedNow = new Set(placed);
   const slotsAfter = n - 1 - depth;
 
+  /**
+   * Exact minimum total jitter of a fixed chain (order + counter gaps): the
+   * smallest cumulative jitter the chain can realize simultaneously over all
+   * integer timestamp assignments. Infinity when the chain is infeasible.
+   */
+  const exactChainJitter = (chain: number[], chainGaps: number[]): number => {
+    if (jc === undefined) return 0;
+    if (chainGaps.length === 0) return 0;
+    const windows = tightenWindows(packets, chain, chainGaps, minInterval, maxInterval);
+    if (windows === null) return Infinity;
+    const cands = jitterCandidates(
+      packets, chain, windows, chainGaps, minInterval, maxInterval, jc.nominalInterval,
+    );
+    return minChainJitter(cands, chainGaps, minInterval, maxInterval, jc.nominalInterval);
+  };
+
   // Complete chain whose every structural constraint holds but whose exact
   // minimum cumulative jitter exceeds the budget: report the shortfall.
   if (jc !== undefined && depth === n) {
-    const windows = tightenWindows(packets, placed, deadGaps, minInterval, maxInterval);
     let jMin = Number.isFinite(jitterLB) ? jitterLB : Infinity;
-    if (windows !== null) {
-      const cands = jitterCandidates(
-        packets, placed, windows, deadGaps, minInterval, maxInterval, jc.nominalInterval,
-      );
-      const v = minChainJitter(cands, deadGaps, minInterval, maxInterval, jc.nominalInterval);
-      if (Number.isFinite(v)) jMin = v;
-    }
+    const exact = exactChainJitter(placed, deadGaps);
+    if (Number.isFinite(exact)) jMin = exact;
     if (Number.isFinite(jMin) && jMin > jc.totalJitterBudget) {
       const lastP = packets[last];
       return make({
@@ -1490,36 +1500,45 @@ function buildFailureEvidence(
   }
 
   // Forced jitter of the fixed partial order, needed to report cumulative
-  // budget usage at the dead end. Reconstruct the FORWARD-tightened per-node
-  // windows exactly as the search carried them (the dead frontier tLo/tHi is
-  // such a forward window), then sum each edge's forced-jitter lower bound.
+  // budget usage at the dead end. This must be the minimum cumulative jitter
+  // the WHOLE prefix can realize simultaneously (the exact fixed-chain
+  // optimum): summing per-edge lower bounds would undercount whenever the
+  // individual edge minima are attained at mutually incompatible timestamps.
   let prefixJitterUsed = 0;
   if (jc !== undefined && placed.length > 0) {
-    const fw: { lo: number; hi: number }[] = [];
-    for (let k = 0; k < placed.length; k++) {
-      const pp = packets[placed[k]];
-      if (k === 0) fw.push({ lo: pp.lo, hi: pp.hi });
-      else {
-        const dd = deadGaps[k - 1];
-        fw.push({
-          lo: Math.max(pp.lo, fw[k - 1].lo + dd * minInterval),
-          hi: Math.min(pp.hi, fw[k - 1].hi + dd * maxInterval),
-        });
+    const exact = exactChainJitter(placed, deadGaps);
+    if (Number.isFinite(exact)) {
+      prefixJitterUsed = exact;
+    } else {
+      // Defensive fallback (the search only records feasible prefixes): sum
+      // of per-edge lower bounds over the forward-tightened per-edge windows
+      // reconstructed exactly as the search carried them.
+      const fw: { lo: number; hi: number }[] = [];
+      for (let k = 0; k < placed.length; k++) {
+        const pp = packets[placed[k]];
+        if (k === 0) fw.push({ lo: pp.lo, hi: pp.hi });
+        else {
+          const dd = deadGaps[k - 1];
+          fw.push({
+            lo: Math.max(pp.lo, fw[k - 1].lo + dd * minInterval),
+            hi: Math.min(pp.hi, fw[k - 1].hi + dd * maxInterval),
+          });
+        }
       }
+      for (let k = 0; k < deadGaps.length; k++) {
+        prefixJitterUsed += edgeJitterLowerBound(
+          deadGaps[k],
+          fw[k].lo,
+          fw[k].hi,
+          fw[k + 1].lo,
+          fw[k + 1].hi,
+          minInterval,
+          maxInterval,
+          jc.nominalInterval,
+        );
+      }
+      if (!Number.isFinite(prefixJitterUsed)) prefixJitterUsed = Number.isFinite(jitterLB) ? jitterLB : 0;
     }
-    for (let k = 0; k < deadGaps.length; k++) {
-      prefixJitterUsed += edgeJitterLowerBound(
-        deadGaps[k],
-        fw[k].lo,
-        fw[k].hi,
-        fw[k + 1].lo,
-        fw[k + 1].hi,
-        minInterval,
-        maxInterval,
-        jc.nominalInterval,
-      );
-    }
-    if (!Number.isFinite(prefixJitterUsed)) prefixJitterUsed = Number.isFinite(jitterLB) ? jitterLB : 0;
   }
 
   // Reproduce the canonical successor scan at the deepest dead end. For each
@@ -1642,10 +1661,13 @@ function buildFailureEvidence(
     });
   }
 
-  const causeRank = { TIME_GAP: 0, COUNT_WINDOW: 1, CONGRUENCE: 2, JITTER_BUDGET: 3 } as const;
+  // First blocker in the search's canonical move order: smallest rejected
+  // counter gap, then smallest packet id. The reported cause is whatever
+  // constraint blocks THAT move — a structural failure of an unrelated later
+  // packet must not override an earlier packet's jitter-budget block, nor
+  // vice versa.
   blockers.sort(
     (a, b) =>
-      causeRank[a.cause] - causeRank[b.cause] ||
       a.dStar - b.dStar ||
       compareId(packets[a.j].id, packets[b.j].id),
   );
