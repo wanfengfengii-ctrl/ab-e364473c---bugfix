@@ -45,8 +45,13 @@ interface DeadState {
   c0hi: number;
   tLo: number;
   tHi: number;
-  /** Forced lower bound on prefix jitter at the dead state (budget enabled). */
-  jitterLB: number;
+  /**
+   * Exact minimum cumulative jitter jointly achievable by the WHOLE fixed
+   * prefix (budget enabled). This is a chain-level minimum, never a sum of
+   * per-edge local lower bounds: the per-edge minima may require mutually
+   * incompatible timestamp choices and cannot be added together.
+   */
+  prefixJitter: number;
 }
 
 function modNonNeg(a: number, m: number): number {
@@ -854,7 +859,10 @@ export function solve(
         const ntLo = Math.max(pj.lo, tLo + d * minInterval);
         const ntHi = Math.min(pj.hi, tHi + d * maxInterval);
         if (njLo > njHi || ntLo > ntHi) return null;
-        if (jc !== undefined) {
+        // A jlb of Infinity is the sentinel meaning "ignore the budget": it
+        // enumerates every structurally admissible move (used by the
+        // structural-completion oracle behind first-blocker evidence).
+        if (jc !== undefined && Number.isFinite(jlb)) {
           const forced = edgeJitterLB(d, tLo, tHi, ntLo, ntHi);
           if (jlb + forced > jitterBudget) return null;
         }
@@ -881,7 +889,7 @@ export function solve(
     c0hi: number,
     tLo: number,
     tHi: number,
-    jlb = Infinity,
+    prefixJitter = Infinity,
   ): void => {
     if (bestDead === null || depth > bestDead.depth) {
       bestDead = {
@@ -894,15 +902,21 @@ export function solve(
         c0hi,
         tLo,
         tHi,
-        jitterLB: jc !== undefined ? jlb : Infinity,
+        prefixJitter: jc !== undefined ? prefixJitter : Infinity,
       };
     }
   };
 
-  /** Exact fixed-chain budget test for the complete order in the shared
-   * arrays (orderArr[0..depth-1], gapsArr[0..depth-2]). Returns the minimum
-   * total jitter, or Infinity when the chain is infeasible / over budget. */
-  const chainMinJitter = (depth: number): number => {
+  /**
+   * Exact minimum total jitter jointly achievable by the fixed prefix in the
+   * shared arrays (orderArr[0..depth-1], gapsArr[0..depth-2]), WITHOUT clamping
+   * to the budget. This is the genuine chain-level minimum over a single
+   * timestamp vector realizing every edge simultaneously; it must never be
+   * formed by adding per-edge local lower bounds, whose minima can demand
+   * incompatible timestamps. Infinity when the prefix is structurally
+   * infeasible.
+   */
+  const prefixMinJitterExact = (depth: number): number => {
     if (jc === undefined) return 0;
     const order = orderArr.slice(0, depth);
     const gaps = gapsArr.slice(0, depth - 1);
@@ -917,8 +931,16 @@ export function solve(
       maxInterval,
       jc.nominalInterval,
     );
-    const v = minChainJitter(cands, gaps, minInterval, maxInterval, jc.nominalInterval);
-    return v <= jc.totalJitterBudget ? v : Infinity;
+    return minChainJitter(cands, gaps, minInterval, maxInterval, jc.nominalInterval);
+  };
+
+  /** Exact fixed-chain budget test for the complete order in the shared
+   * arrays (orderArr[0..depth-1], gapsArr[0..depth-2]). Returns the minimum
+   * total jitter, or Infinity when the chain is infeasible / over budget. */
+  const chainMinJitter = (depth: number): number => {
+    if (jc === undefined) return 0;
+    const v = prefixMinJitterExact(depth);
+    return Number.isFinite(v) && v <= jc.totalJitterBudget ? v : Infinity;
   };
 
   // ------------------------------------------------------------------ Phase A
@@ -929,12 +951,21 @@ export function solve(
   let bestA = Infinity;
   let stopA = false;
 
-  const dfsA = (depth: number, last: number, S: number, c0lo: number, c0hi: number, tLo: number, tHi: number, jlb = 0): number => {
+  const dfsA = (
+    depth: number,
+    last: number,
+    S: number,
+    c0lo: number,
+    c0hi: number,
+    tLo: number,
+    tHi: number,
+    prefixJitter = 0,
+  ): number => {
     if (stopA) return Infinity;
     if (depth === n) {
       const jm = chainMinJitter(depth);
       if (!Number.isFinite(jm)) {
-        recordDead(depth, last, S, c0lo, c0hi, tLo, tHi, jlb);
+        recordDead(depth, last, S, c0lo, c0hi, tLo, tHi, prefixJitter);
         return Infinity;
       }
       if (S < bestA) bestA = S;
@@ -957,9 +988,14 @@ export function solve(
     const cached = memoA.get(key);
     if (cached !== undefined) return cached;
 
-    const moves = enumerateMoves(depth, last, S, c0lo, c0hi, tLo, tHi, mask, jlb);
+    // Exact chain-level minimum jitter of the whole fixed prefix (never a sum
+    // of per-edge local minima, which may be mutually incompatible). The value
+    // is computed by the parent and carried in (a single-node root is exactly
+    // 0).
+    const prefixExact = prefixJitter;
+    const moves = enumerateMoves(depth, last, S, c0lo, c0hi, tLo, tHi, mask, prefixExact);
     if (moves.length === 0) {
-      recordDead(depth, last, S, c0lo, c0hi, tLo, tHi, jlb);
+      recordDead(depth, last, S, c0lo, c0hi, tLo, tHi, prefixExact);
       memoA.set(key, Infinity);
       return Infinity;
     }
@@ -972,17 +1008,20 @@ export function solve(
       gapsArr[depth - 1] = mv.d;
       tLoArr[depth] = mv.tLo;
       tHiArr[depth] = mv.tHi;
-      const childJlb =
-        jc === undefined
-          ? 0
-          : jlb + edgeJitterLB(mv.d, tLo, tHi, mv.tLo, mv.tHi);
-      const v = dfsA(depth + 1, mv.j, S + mv.d, mv.c0lo, mv.c0hi, mv.tLo, mv.tHi, childJlb);
+      // Exact chain-level minimum over the extended prefix (all edges realized
+      // by a single timestamp vector); carried down so every deeper prune uses
+      // the genuinely jointly achievable spend rather than a sum of
+      // incompatible per-edge minima.
+      const childPrefix = jc === undefined ? 0 : prefixMinJitterExact(depth + 1);
+      const v = dfsA(
+        depth + 1, mv.j, S + mv.d, mv.c0lo, mv.c0hi, mv.tLo, mv.tHi, childPrefix,
+      );
       used[mv.j] = 0;
       if (v < best) best = v;
       if (stopA) break;
     }
     if (best === Infinity) {
-      recordDead(depth, last, S, c0lo, c0hi, tLo, tHi, jlb);
+      recordDead(depth, last, S, c0lo, c0hi, tLo, tHi, prefixExact);
     }
     memoA.set(key, best);
     return best;
@@ -999,7 +1038,54 @@ export function solve(
     dfsA(1, seed.index, 0, seed.baseCount, c0hi0, seed.lo, seed.hi);
   }
   if (bestA === Infinity) {
-    throw buildFailureEvidence(packets, pair, bestDead, modulus, countUpper, minInterval, maxInterval, jc);
+    // Cast: bestDead is only assigned inside the recordDead closure, which
+    // control-flow analysis does not track.
+    const dead = bestDead as DeadState | null;
+    // Whether the deepest dead prefix admits ANY completion when the jitter
+    // budget is ignored. This separates a budget-only stop (the prefix is
+    // structurally completable and the budget is the sole obstruction) from a
+    // pure structural dead end (no completion exists even with infinite
+    // budget), which must keep its TIME_GAP/COUNT_WINDOW/CONGRUENCE class.
+    let structurallyExtendable = true;
+    if (jc !== undefined && dead !== null && dead.depth < n) {
+      const { placed, last, S, c0lo: dC0lo, c0hi: dC0hi, tLo: dTLo, tHi: dTHi } = dead;
+      let mask0 = 0;
+      for (const ix of placed) mask0 |= 1 << ix;
+      const memoStruct = new Map<string, boolean>();
+      const structDfs = (
+        depth: number,
+        lastJ: number,
+        sS: number,
+        sC0lo: number,
+        sC0hi: number,
+        sTLo: number,
+        sTHi: number,
+        mask: number,
+      ): boolean => {
+        if (depth === n) return true;
+        const key = `S|${mask}|${lastJ}|${sS}|${sC0lo}|${sC0hi}|${sTLo}|${sTHi}`;
+        const cached = memoStruct.get(key);
+        if (cached !== undefined) return cached;
+        // Infinity disables the budget filter inside enumerateMoves.
+        const moves = enumerateMoves(
+          depth, lastJ, sS, sC0lo, sC0hi, sTLo, sTHi, mask, Infinity,
+        );
+        let ok = false;
+        for (const mv of moves) {
+          if (structDfs(depth + 1, mv.j, sS + mv.d, mv.c0lo, mv.c0hi, mv.tLo, mv.tHi, mask | (1 << mv.j))) {
+            ok = true;
+            break;
+          }
+        }
+        memoStruct.set(key, ok);
+        return ok;
+      };
+      structurallyExtendable = structDfs(placed.length, last, S, dC0lo, dC0hi, dTLo, dTHi, mask0);
+    }
+    throw buildFailureEvidence(
+      packets, pair, dead, modulus, countUpper, minInterval, maxInterval, jc,
+      structurallyExtendable,
+    );
   }
   const Pstar = bestA;
 
@@ -1428,6 +1514,13 @@ function buildFailureEvidence(
   minInterval: number,
   maxInterval: number,
   jc?: JitterConfig,
+  /**
+   * Whether the deepest dead prefix still admits some completion if the jitter
+   * budget is ignored. False means the stop is a pure structural dead end
+   * (time/count/congruence), which must keep its structural cause even when a
+   * locally admissible successor also happens to exceed the budget.
+   */
+  structurallyExtendable = true,
 ): SolveError {
   const make = (evidence: ConstraintFailureEvidence): SolveError =>
     new SolveError(
@@ -1447,7 +1540,7 @@ function buildFailureEvidence(
   }
 
   const n = packets.length;
-  const { depth, placed, last, S, c0lo, c0hi, tLo, tHi, gaps: deadGaps, jitterLB } = bestDead;
+  const { depth, placed, last, S, c0lo, c0hi, tLo, tHi, gaps: deadGaps, prefixJitter: carriedPrefixJitter } = bestDead;
   const partialOrder = placed.map((ix) => packets[ix].id);
   const usedNow = new Set(placed);
   const slotsAfter = n - 1 - depth;
@@ -1456,7 +1549,7 @@ function buildFailureEvidence(
   // minimum cumulative jitter exceeds the budget: report the shortfall.
   if (jc !== undefined && depth === n) {
     const windows = tightenWindows(packets, placed, deadGaps, minInterval, maxInterval);
-    let jMin = Number.isFinite(jitterLB) ? jitterLB : Infinity;
+    let jMin = Number.isFinite(carriedPrefixJitter) ? carriedPrefixJitter : Infinity;
     if (windows !== null) {
       const cands = jitterCandidates(
         packets, placed, windows, deadGaps, minInterval, maxInterval, jc.nominalInterval,
@@ -1489,37 +1582,24 @@ function buildFailureEvidence(
     }
   }
 
-  // Forced jitter of the fixed partial order, needed to report cumulative
-  // budget usage at the dead end. Reconstruct the FORWARD-tightened per-node
-  // windows exactly as the search carried them (the dead frontier tLo/tHi is
-  // such a forward window), then sum each edge's forced-jitter lower bound.
+  // Exact minimum cumulative jitter already consumed by the fixed partial
+  // order: the minimum over a SINGLE timestamp vector realizing every edge of
+  // the prefix simultaneously. It must not be formed by summing per-edge
+  // forced-jitter lower bounds, whose individual minima can demand
+  // incompatible timestamps (e.g. an edge minimized at each endpoint bound).
   let prefixJitterUsed = 0;
   if (jc !== undefined && placed.length > 0) {
-    const fw: { lo: number; hi: number }[] = [];
-    for (let k = 0; k < placed.length; k++) {
-      const pp = packets[placed[k]];
-      if (k === 0) fw.push({ lo: pp.lo, hi: pp.hi });
-      else {
-        const dd = deadGaps[k - 1];
-        fw.push({
-          lo: Math.max(pp.lo, fw[k - 1].lo + dd * minInterval),
-          hi: Math.min(pp.hi, fw[k - 1].hi + dd * maxInterval),
-        });
+    let v = carriedPrefixJitter;
+    if (!Number.isFinite(v)) {
+      const windows = tightenWindows(packets, placed, deadGaps, minInterval, maxInterval);
+      if (windows !== null) {
+        const cands = jitterCandidates(
+          packets, placed, windows, deadGaps, minInterval, maxInterval, jc.nominalInterval,
+        );
+        v = minChainJitter(cands, deadGaps, minInterval, maxInterval, jc.nominalInterval);
       }
     }
-    for (let k = 0; k < deadGaps.length; k++) {
-      prefixJitterUsed += edgeJitterLowerBound(
-        deadGaps[k],
-        fw[k].lo,
-        fw[k].hi,
-        fw[k + 1].lo,
-        fw[k + 1].hi,
-        minInterval,
-        maxInterval,
-        jc.nominalInterval,
-      );
-    }
-    if (!Number.isFinite(prefixJitterUsed)) prefixJitterUsed = Number.isFinite(jitterLB) ? jitterLB : 0;
+    prefixJitterUsed = Number.isFinite(v) ? v : 0;
   }
 
   // Reproduce the canonical successor scan at the deepest dead end. For each
@@ -1599,6 +1679,7 @@ function buildFailureEvidence(
 
     const budgetBlocks =
       jc !== undefined &&
+      structurallyExtendable &&
       dBoth !== Infinity &&
       Number.isFinite(minEdgeJitter) &&
       prefixJitterUsed + minEdgeJitter > jc.totalJitterBudget;
@@ -1642,7 +1723,12 @@ function buildFailureEvidence(
     });
   }
 
-  const causeRank = { TIME_GAP: 0, COUNT_WINDOW: 1, CONGRUENCE: 2, JITTER_BUDGET: 3 } as const;
+  // A JITTER_BUDGET blocker takes precedence over every structural class:
+  // such a successor is individually admissible (time, count and congruence
+  // all hold) and the search can only not extend because the budget is
+  // exhausted. An unrelated successor failing, say, its count window must not
+  // mask that true budget stop. Structural classes keep their old order.
+  const causeRank = { JITTER_BUDGET: 0, TIME_GAP: 1, COUNT_WINDOW: 2, CONGRUENCE: 3 } as const;
   blockers.sort(
     (a, b) =>
       causeRank[a.cause] - causeRank[b.cause] ||
@@ -1659,18 +1745,27 @@ function buildFailureEvidence(
 
     if (b.cause === 'JITTER_BUDGET') {
       const minAdd = b.minEdgeJitter;
+      const overPrefix = prefixJitterUsed > jc!.totalJitterBudget;
+      const reason = overPrefix
+        ? `cannot append packet ${String(pj.id)} after packet ${prevId} within the cumulative ` +
+          `jitter budget: the fixed partial order ${partialOrder.map(String).join(' -> ')} alone ` +
+          `already forces a minimum total jitter of ${prefixJitterUsed}, which exceeds the budget ` +
+          `${jc!.totalJitterBudget}, and every otherwise admissible congruent gap for this packet ` +
+          `adds at least ${minAdd} more jitter (first reached at gap ${finite(b.minEdgeGap)}), for a ` +
+          `total of at least ${prefixJitterUsed + minAdd}; nominal interval ${jc!.nominalInterval} ` +
+          `(time/count/congruence constraints all admit the extension)`
+        : `cannot append packet ${String(pj.id)} after packet ${prevId} within the cumulative ` +
+          `jitter budget: the fixed partial order has already forced ${prefixJitterUsed} of the ` +
+          `${jc!.totalJitterBudget} budget, and every otherwise admissible congruent gap for this ` +
+          `packet adds at least ${minAdd} more jitter (first reached at gap ${finite(b.minEdgeGap)}), ` +
+          `so ${prefixJitterUsed + minAdd} > ${jc!.totalJitterBudget}; nominal interval ` +
+          `${jc!.nominalInterval} (time/count/congruence constraints all admit the extension)`;
       return make({
         stage: 'extension',
         partialLength: depth,
         partialOrder,
         candidateId: pj.id,
-        reason:
-          `cannot append packet ${String(pj.id)} after packet ${prevId} within the cumulative ` +
-          `jitter budget: the fixed partial order has already forced ${prefixJitterUsed} of the ` +
-          `${jc!.totalJitterBudget} budget, and every otherwise admissible congruent gap for this ` +
-          `packet adds at least ${minAdd} more jitter (first reached at gap ${finite(b.minEdgeGap)}), ` +
-          `so ${prefixJitterUsed + minAdd} > ${jc!.totalJitterBudget}; nominal interval ` +
-          `${jc!.nominalInterval} (time/count/congruence constraints all admit the extension)`,
+        reason,
         detail: {
           cause: 'JITTER_BUDGET',
           minimalCongruentGap: Number.isFinite(b.minEdgeGap) ? b.minEdgeGap : undefined,

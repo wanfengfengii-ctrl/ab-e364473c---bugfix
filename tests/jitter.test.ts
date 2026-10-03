@@ -178,6 +178,49 @@ describe('jitter budget: first-blocking evidence', () => {
       caught!.evidence?.detail?.cause,
     );
   });
+
+  it('attributes the first blocker to the budget (D), not an unrelated count window (E)', () => {
+    // A..F fixed at 0/25/40/50/60 with B free in [10,15]; modulus 100, count
+    // window [0,5], sample interval [1,20].
+    const packets: PacketInput[] = [
+      { id: 'A', remainder: 0, timeLower: 0, timeUpper: 0 },
+      { id: 'B', remainder: 1, timeLower: 10, timeUpper: 15 },
+      { id: 'C', remainder: 2, timeLower: 25, timeUpper: 25 },
+      { id: 'D', remainder: 3, timeLower: 40, timeUpper: 40 },
+      { id: 'E', remainder: 4, timeLower: 50, timeUpper: 50 },
+      { id: 'F', remainder: 5, timeLower: 60, timeUpper: 60 },
+    ];
+
+    // Without a budget there is a unique complete chain A -> B -> C -> D -> E -> F.
+    const plain = solve(packets, 100, 0, 5, 1, 20);
+    expect(plain.order).toEqual(['A', 'B', 'C', 'D', 'E', 'F']);
+    expect(plain.assignments.map((a) => a.absoluteCount)).toEqual([0, 1, 2, 3, 4, 5]);
+
+    let caught: SolveError | null = null;
+    try {
+      solve(packets, 100, 0, 5, 1, 20, { nominalInterval: 10, totalJitterBudget: 4 });
+    } catch (e) {
+      caught = e as SolveError;
+    }
+    expect(caught).not.toBeNull();
+    expect(caught!.code).toBe('NO_CONSISTENT_INTERPRETATION');
+    const evidence = caught!.evidence!;
+    expect(evidence.stage).toBe('extension');
+    expect(evidence.partialOrder).toEqual(['A', 'B', 'C']);
+    expect(evidence.candidateId).toBe('D');
+    expect(evidence.detail?.cause).toBe('JITTER_BUDGET');
+    // A -> B -> C has a jointly achievable minimum jitter of 5: it is NOT the
+    // sum of the independently-minimized edges (which would wrongly read
+    // 0 + 0 = 0, since A->B minimizes at B=10 and B->C at B=15, mutually
+    // incompatible). Appending D at its fixed 15-tick gap then forces at least
+    // 5 more, which is the true first obstruction.
+    expect(evidence.detail?.jitter).toEqual({
+      nominalInterval: 10,
+      budget: 4,
+      used: 5,
+      minimumAdditional: 5,
+    });
+  });
 });
 
 describe('jitter budget: differential testing against brute force', () => {
